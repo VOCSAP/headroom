@@ -1100,6 +1100,56 @@ def _token_kind(token: str) -> str:
     return "unknown" if t else "empty"
 
 
+def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
+    """Debug hook: when ``HEADROOM_COPILOT_DEBUG_OUTBOUND`` is set, append a
+    secret-free record of the exact request Headroom is about to forward to the
+    Copilot API. Lets us tell a Headroom bug (wrong host / integration-id / token
+    kind) apart from an upstream entitlement 400 without exposing any token.
+
+    Uncommitted diagnostic — remove with ``git checkout -- headroom/copilot_auth.py``.
+    """
+
+    if os.environ.get("HEADROOM_COPILOT_DEBUG_OUTBOUND", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        auth = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
+        scheme, _, raw = auth.partition(" ")
+        identity = {
+            k: v
+            for k, v in headers.items()
+            if k.lower()
+            in ("copilot-integration-id", "editor-version", "editor-plugin-version", "user-agent")
+        }
+        record = {
+            "host": urlparse(url).netloc,
+            "url": url,
+            "auth_scheme": scheme or "(none)",
+            "token_prefix": (raw[:6] + "…") if raw else "",
+            "token_kind": _token_kind(raw) if raw else "none",
+            "identity_headers": identity,
+        }
+        default_path = Path.home() / ".headroom" / "copilot_outbound.jsonl"
+        out = Path(os.environ.get("HEADROOM_COPILOT_DEBUG_OUTBOUND_FILE", str(default_path)))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        logger.warning(
+            "[copilot-outbound] host=%s integration-id=%s editor=%s token=%s/%s",
+            record["host"],
+            identity.get("Copilot-Integration-Id") or identity.get("copilot-integration-id") or "-",
+            identity.get("Editor-Version") or identity.get("editor-version") or "-",
+            record["auth_scheme"],
+            record["token_kind"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("copilot outbound capture failed: %s", exc)
+
+
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
@@ -1120,6 +1170,7 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             for key in list(resolved):
                 if key.lower() == "x-api-key":
                     resolved.pop(key)
+            _maybe_capture_outbound(url, resolved)
             return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
@@ -1131,4 +1182,5 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
         if key.lower() in {"authorization", "x-api-key"}:
             resolved.pop(key)
     resolved["Authorization"] = f"Bearer {token.token}"
+    _maybe_capture_outbound(url, resolved)
     return resolved
