@@ -1354,7 +1354,9 @@ class HeadroomProxy(
         # InferenceSession objects (classifier + SigLIP) are built once here
         # instead of being rebuilt on every image request — the source of the
         # multi-second per-image latency.
-        if self.config.optimize:
+        from headroom.proxy.helpers import image_optimizer_disabled
+
+        if self.config.optimize and not image_optimizer_disabled():
             self.warmup.image.mark_loading()
             try:
                 from headroom.models.ml_models import MLModelRegistry

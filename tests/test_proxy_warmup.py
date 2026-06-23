@@ -177,6 +177,18 @@ async def test_startup_runs_shared_transform_once(_stub_pipelines):
 
 
 @pytest.mark.asyncio
+async def test_startup_image_slot_null_when_disabled(_stub_pipelines, monkeypatch):
+    proxy, _spy = _stub_pipelines
+    monkeypatch.setenv("HEADROOM_DISABLE_IMAGE_OPTIMIZER", "1")
+    await proxy.startup()
+    try:
+        # Optimize is on, but the env opt-out must skip the image preload.
+        assert proxy.warmup.image.status == "null"
+    finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_startup_optimize_false_leaves_slots_null():
     pytest.importorskip("httpx")
     from headroom.proxy.server import HeadroomProxy, ProxyConfig
