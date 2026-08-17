@@ -269,3 +269,7 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+
+# Local agent tooling
+.claude/settings.json
+.kleos-space
