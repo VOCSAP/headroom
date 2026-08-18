@@ -22,6 +22,7 @@ from headroom.pricing.litellm_pricing import resolve_litellm_model
 log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
+DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -133,6 +134,16 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     return result
 
 
+def _decode_perf_savings(value: str) -> list[dict[str, object]]:
+    # Local import keeps the analyzer usable against old logs/install layouts.
+    try:
+        from headroom.proxy.savings_attribution import decode
+
+        return decode(value)
+    except Exception:
+        return []
+
+
 @dataclass
 class PerfRecord:
     """A single parsed PERF log entry."""
@@ -145,6 +156,7 @@ class PerfRecord:
     tokens_before: int = 0
     tokens_after: int = 0
     tokens_saved: int = 0
+    tool_saved: int = 0
     cache_read: int = 0
     cache_write: int = 0
     cache_hit_pct: int = 0
@@ -154,6 +166,12 @@ class PerfRecord:
     tokens_out: int = 0
     ttfb_ms: float = 0.0
     stages: dict[str, float] = field(default_factory=dict)
+    savings_breakdown: list[dict[str, object]] = field(default_factory=list)
+    # True when the proxy answered from its own response cache and never
+    # contacted the upstream. Such a turn has all-zero token counters and no
+    # upstream stage timings, so without this flag it reads as a turn that
+    # did nothing (#3019). Absent from pre-#3019 logs, hence the default.
+    from_response_cache: bool = False
 
 
 @dataclass
@@ -210,6 +228,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -249,7 +271,17 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -336,6 +368,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
+                                tool_saved=int(kv.get("tool_saved", 0)),
+                                savings_breakdown=_decode_perf_savings(kv.get("savings", "none")),
                                 cache_read=int(kv.get("cache_read", 0)),
                                 cache_write=int(kv.get("cache_write", 0)),
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
@@ -344,6 +378,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 total_ms=float(kv.get("total_ms", 0)),
                                 tokens_out=int(kv.get("tok_out", 0)),
                                 ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                from_response_cache=kv.get("cached", "0") == "1",
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
@@ -441,14 +476,15 @@ def format_report(report: PerfReport) -> str:
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(
@@ -464,11 +500,26 @@ def format_report(report: PerfReport) -> str:
         total_before = sum(r.tokens_before for r in records)
         total_after = sum(r.tokens_after for r in records)
         total_saved = sum(r.tokens_saved for r in records)
+        total_tool_saved = sum(r.tool_saved for r in records)
+        total_headline_saved = total_saved + total_tool_saved
         pct = (total_saved / total_before * 100) if total_before > 0 else 0
+        # All-layers denominator: deferred tool schemas were never in tok_before (they
+        # don't reach count_messages), so the pre-Headroom world is tok_before + them.
+        # Same construction the proxy's /api/stats uses for total_before_compression —
+        # the headline number and the headline percent must share a numerator, or the
+        # tile reads "60,920 saved (0.1%)" off two different definitions of saved.
+        headline_before = total_before + total_tool_saved
+        headline_pct = (total_headline_saved / headline_before * 100) if headline_before > 0 else 0
 
         lines.append(f"Requests:     {len(records)}")
-        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% reduction)")
-        lines.append(f"Total saved:  {total_saved:,} tokens")
+        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% messages)")
+        # ONE headline. Tool-schema deferral can't move tok_before/after (messages never
+        # include tool bytes), so it used to render as a rival "Tool saved" line — which
+        # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
+        lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
+        if total_tool_saved > 0:
+            lines.append(f"  · messages       {max(0, total_saved):,}")
+            lines.append(f"  · tool schemas   {total_tool_saved:,}")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -536,15 +587,31 @@ def format_report(report: PerfReport) -> str:
         # Optimization latency
         opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
         if opt_times:
-            avg_opt = sum(opt_times) / len(opt_times)
-            max_opt = max(opt_times)
+            overhead = build_overhead_summary(report)
+            opt_stats = overhead["optimization_ms"]
             lines.append("Optimization Overhead")
             lines.append("-" * 40)
-            lines.append(f"  Average:  {avg_opt:.0f}ms")
-            lines.append(f"  Max:      {max_opt:.0f}ms")
-            slow = [t for t in opt_times if t > 500]
-            if slow:
-                lines.append(f"  >500ms:   {len(slow)} requests")
+            lines.append(f"  Average:     {opt_stats['average_ms']:.0f}ms")
+            lines.append(
+                "  p50/p95/p99: "
+                f"{opt_stats['p50_ms']:.0f} / "
+                f"{opt_stats['p95_ms']:.0f} / "
+                f"{opt_stats['p99_ms']:.0f}ms"
+            )
+            lines.append(f"  Max:         {opt_stats['max_ms']:.0f}ms")
+            if opt_stats["slow_request_count"]:
+                lines.append(
+                    f"  >{overhead['slow_threshold_ms']:.0f}ms:      "
+                    f"{opt_stats['slow_request_count']} requests "
+                    f"({opt_stats['slow_request_pct']:.1f}%)"
+                )
+            if overhead["stage_breakdown"]:
+                lines.append("  Slowest stages:")
+                for stage in overhead["stage_breakdown"][:3]:
+                    lines.append(
+                        f"    {stage['stage']}: total {stage['total_ms']:.0f}ms, "
+                        f"p95 {stage['p95_ms']:.0f}ms, max {stage['max_ms']:.0f}ms"
+                    )
             lines.append("")
 
         # Throughput
@@ -693,6 +760,7 @@ PERF_RECORD_FIELDS = [
     "tokens_before",
     "tokens_after",
     "tokens_saved",
+    "tool_saved",
     "cache_read",
     "cache_write",
     "cache_hit_pct",
@@ -702,6 +770,10 @@ PERF_RECORD_FIELDS = [
     "tokens_out",
     "ttfb_ms",
     "stages",
+    "savings_breakdown",
+    # Appended last so every existing CSV column keeps its position; a reader
+    # that indexes by name is unaffected either way.
+    "from_response_cache",
 ]
 
 
@@ -721,6 +793,102 @@ def _percentile(data: list[float], pct: float) -> float:
     if upper < len(sorted_data):
         return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
     return sorted_data[lower]
+
+
+def _latency_stats(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "average_ms": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "max_ms": 0.0,
+        }
+    return {
+        "count": len(values),
+        "average_ms": round(sum(values) / len(values), 2),
+        "p50_ms": round(_percentile(values, 0.50), 2),
+        "p95_ms": round(_percentile(values, 0.95), 2),
+        "p99_ms": round(_percentile(values, 0.99), 2),
+        "max_ms": round(max(values), 2),
+    }
+
+
+def _slowest_stage(record: PerfRecord) -> tuple[str | None, float]:
+    stages = [(name, value) for name, value in record.stages.items() if value > 0]
+    if not stages:
+        return None, 0.0
+    return max(stages, key=lambda item: item[1])
+
+
+def build_overhead_summary(
+    report: PerfReport,
+    *,
+    slow_threshold_ms: float = DEFAULT_SLOW_OPTIMIZATION_MS,
+    limit: int = 10,
+) -> dict:
+    """Aggregate optimization latency and stage-level bottlenecks."""
+    records = report.perf_records
+    opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
+    total_times = [r.total_ms for r in records if r.total_ms > 0]
+    slow_records = [r for r in records if r.optimization_ms > slow_threshold_ms]
+
+    stage_values: dict[str, list[float]] = {}
+    for record in records:
+        for stage, value in record.stages.items():
+            if value > 0:
+                stage_values.setdefault(stage, []).append(value)
+
+    stage_breakdown = []
+    for stage, values in stage_values.items():
+        stats = _latency_stats(values)
+        stage_breakdown.append(
+            {
+                "stage": stage,
+                **stats,
+                "total_ms": round(sum(values), 2),
+            }
+        )
+    stage_breakdown.sort(key=lambda row: row["total_ms"], reverse=True)
+
+    top_slow_requests = []
+    for record in sorted(
+        [r for r in records if r.optimization_ms > 0],
+        key=lambda r: r.optimization_ms,
+        reverse=True,
+    )[:limit]:
+        slowest_stage, slowest_stage_ms = _slowest_stage(record)
+        top_slow_requests.append(
+            {
+                "timestamp": record.timestamp,
+                "request_id": record.request_id,
+                "model": record.model,
+                "client": record.client,
+                "optimization_ms": record.optimization_ms,
+                "total_ms": record.total_ms,
+                "tokens_before": record.tokens_before,
+                "tokens_after": record.tokens_after,
+                "tokens_saved": record.tokens_saved,
+                "slowest_stage": slowest_stage,
+                "slowest_stage_ms": slowest_stage_ms,
+                "transforms": record.transforms,
+            }
+        )
+
+    return {
+        "slow_threshold_ms": slow_threshold_ms,
+        "optimization_ms": {
+            **_latency_stats(opt_times),
+            "slow_request_count": len(slow_records),
+            "slow_request_pct": round(len(slow_records) / len(records) * 100, 1)
+            if records
+            else 0.0,
+        },
+        "total_ms": _latency_stats(total_times),
+        "stage_breakdown": stage_breakdown,
+        "top_slow_requests": top_slow_requests,
+    }
 
 
 def calculate_throughput(report: PerfReport) -> dict:
@@ -840,6 +1008,8 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_before = sum(r.tokens_before for r in records)
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
+    total_tool_saved = sum(r.tool_saved for r in records)
+    total_headline_saved = total_saved + total_tool_saved
 
     total_cr = sum(r.cache_read for r in records)
     total_cw = sum(r.cache_write for r in records)
@@ -853,7 +1023,9 @@ def build_perf_summary(report: PerfReport) -> dict:
     for model, recs in sorted(by_model_groups.items()):
         m_before = sum(r.tokens_before for r in recs)
         m_after = sum(r.tokens_after for r in recs)
-        m_saved = sum(r.tokens_saved for r in recs)
+        m_message_saved = sum(r.tokens_saved for r in recs)
+        m_tool_saved = sum(r.tool_saved for r in recs)
+        m_saved = m_message_saved + m_tool_saved
         by_model.append(
             {
                 "model": model,
@@ -861,7 +1033,9 @@ def build_perf_summary(report: PerfReport) -> dict:
                 "tokens_before": m_before,
                 "tokens_after": m_after,
                 "tokens_saved": m_saved,
-                "savings_pct": _pct(m_saved, m_before),
+                "message_tokens_saved": m_message_saved,
+                "tool_tokens_saved": m_tool_saved,
+                "savings_pct": _pct(m_saved, m_before + m_tool_saved),
                 "list_price_per_mtok": _get_list_price(model),
             }
         )
@@ -885,6 +1059,37 @@ def build_perf_summary(report: PerfReport) -> dict:
             }
         )
 
+    by_source_groups: dict[tuple[str, bool], dict[str, int | float | str | bool]] = {}
+    for record in records:
+        for item in record.savings_breakdown:
+            source = str(item.get("source") or "other")
+            realized = bool(item.get("realized", True))
+            key = (source, realized)
+            row = by_source_groups.setdefault(
+                key,
+                {
+                    "source": source,
+                    "realized": realized,
+                    "events": 0,
+                    "tokens": 0,
+                    "usd": 0.0,
+                },
+            )
+            row["events"] = int(row["events"]) + 1
+            raw_tokens = item.get("tokens", 0)
+            raw_usd = item.get("usd", 0.0)
+            tokens = int(raw_tokens) if isinstance(raw_tokens, (str, int, float)) else 0
+            usd = float(raw_usd) if isinstance(raw_usd, (str, int, float)) else 0.0
+            row["tokens"] = int(row["tokens"]) + max(0, tokens)
+            row["usd"] = round(
+                float(row["usd"]) + usd,
+                12,
+            )
+    by_source = sorted(
+        by_source_groups.values(),
+        key=lambda row: (-int(row["tokens"]), str(row["source"])),
+    )
+
     return {
         "window_hours": report.requested_hours,
         "actual_window": {
@@ -895,13 +1100,21 @@ def build_perf_summary(report: PerfReport) -> dict:
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
+        # total_tokens_saved is the headline (messages + tool-schema deferral); the two
+        # components stay for consumers that break the number down. See
+        # headroom.proxy.tool_schema_savings_policy.
+        "total_tokens_saved": total_headline_saved,
+        "total_savings_pct": _pct(total_headline_saved, total_before + total_tool_saved),
         "tokens_saved": total_saved,
+        "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "by_source": by_source,
+        "overhead": build_overhead_summary(report),
         "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
@@ -1027,11 +1240,18 @@ def _generate_recommendations(report: PerfReport) -> list[str]:
                     )
 
         # Optimization latency
-        slow = [r for r in report.perf_records if r.optimization_ms > 500]
-        if len(slow) > len(report.perf_records) * 0.2:
+        overhead = build_overhead_summary(report)
+        opt_stats = overhead["optimization_ms"]
+        slow_count = int(opt_stats["slow_request_count"])
+        if slow_count > len(report.perf_records) * 0.2:
+            stage_hint = ""
+            if overhead["stage_breakdown"]:
+                stage_hint = f"; top stage: {overhead['stage_breakdown'][0]['stage']}"
             recs.append(
-                f"{len(slow)} requests took >500ms for optimization — "
-                "consider reducing transform pipeline"
+                f"{slow_count} requests took >{overhead['slow_threshold_ms']:.0f}ms "
+                "for optimization"
+                f"{stage_hint} — consider reducing heavy transforms or lowering "
+                "HEADROOM_COMPRESSION_TIMEOUT_SECONDS"
             )
 
     if report.router_records:

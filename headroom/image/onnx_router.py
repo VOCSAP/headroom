@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from headroom.image.trained_router import ImageSignals, RouteDecision, Technique
+from headroom.image.image_types import ImageSignals, RouteDecision, Technique
 from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 logger = logging.getLogger(__name__)
@@ -110,19 +110,6 @@ class OnnxTechniqueRouter:
             f"SigLIP image encoder loaded: ONNX INT8 "
             f"({Path(model_path).stat().st_size // 1024 // 1024} MB)"
         )
-
-    def preload(self) -> None:
-        """Eagerly build the ONNX sessions so request-time use is warm.
-
-        Idempotent: ``_load_classifier`` / ``_load_siglip`` no-op when their
-        session already exists. Called by the proxy warmup at startup so the
-        shared (registry-cached) router never cold-builds its InferenceSession
-        objects on the first image request — the source of the multi-second
-        per-image latency.
-        """
-        self._load_classifier()
-        if self.use_siglip:
-            self._load_siglip()
 
     def classify_query(self, query: str) -> tuple[Technique, float]:
         """Classify query intent using ONNX technique router."""
